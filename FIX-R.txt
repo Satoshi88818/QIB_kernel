@@ -1,0 +1,104 @@
+FIX-R — Kani's Actual Blocker, and Real CBMC Verification in Its Place
+
+Status: Kani itself could not be run in this sandbox — a specific, confirmed, unfixable network restriction, not a guess. In its place, the underlying model checker Kani uses (CBMC) was run directly and for real, exhaustively verifying isqrt_u64_fixed's correctness property at 8-bit and 16-bit domains, plus a targeted exact-arithmetic check of the hardest boundary case (n near u64::MAX) at the full 64-bit width. Two real bugs were found and fixed in the verification harness itself along the way — mirroring exactly what happened with the PyO3 and TLA+ work: real execution surfaces things reasoning alone doesn't.
+
+Why Kani itself can't run here
+
+cargo install --locked kani-verifier --version 0.55.0 # succeeds cargo-kani setup # fails [2/5] Downloading Kani release bundle: kani-0.55.0-x86_64-unknown-linux-gnu.tar.gz [3/5] Installing rust toolchain version: nightly-2024-09-03-x86_64-unknown-linux-gnu Error: Internal failure before invoking command: rustup toolchain install nightly-2024-09-03-x86_64-unknown-linux-gnu Caused by: No such file or directory (os error 2) 
+
+kani-compiler is a rustc_driver shim — confirmed directly by checking the downloaded bundle:
+
+cat /root/.kani/kani-0.55.0/rustc-version # rustc 1.83.0-nightly (bd53aa3bf 2024-09-02) 
+
+It requires linking against that exact nightly build (rustc_driver's ABI is unstable across versions, so no substitute works). That build can only come from rustup pulling from static.rust-lang.org, and:
+
+curl -sI https://static.rust-lang.org # HTTP/2 403 # x-deny-reason: host_not_allowed 
+
+That domain is explicitly blocked by this sandbox's network policy. rustup itself isn't installed, and Ubuntu's apt only carries stable rustc (1.75.0) — no nightly. This is a hard, confirmed stop for running Kani's Rust frontend specifically, not a "probably won't work."
+
+What CBMC-direct can still do
+
+Kani's Rust frontend translates Rust into a form CBMC (the actual model checker) consumes. CBMC itself came bundled in the same download and has no nightly-rustc dependency at all:
+
+/root/.kani/kani-0.55.0/bin/cbmc --version # 6.1.1 (cbmc-6.1.1) 
+
+Since isqrt_u64_fixed (the function FIX-N's Kani harness targets) has no loop — the entire point of FIX-E/FIX-N — it can be faithfully hand-translated to C and verified with CBMC directly, using the identical backend technology Kani would have used, without going through Kani's blocked Rust frontend at all. This is not the same as running Kani on the real Rust source — that distinction is kept explicit throughout this write-up — but it's real, executed, bounded model checking of the same algorithm, not a simulation of one.
+
+Full source
+
+isqrt.c — full 64-bit domain, faithful translation, with the exact 128-bit-arithmetic property check (see "Two real bugs found" below for why it isn't the saturating-multiply version this started as):
+
+/* Faithful C translation of qib-muk/src/quantum/fidelity.rs::isqrt_u64_fixed * (FIX-E: 6 fixed unrolled Newton iterations; FIX-N: no loop exists, so no * unwind bound is needed for the Newton steps themselves). * * This exists to get REAL bounded model checking against the algorithm * using CBMC directly, since Kani's Rust frontend (kani-compiler) requires * linking against a specific nightly rustc build obtainable only via * rustup from static.rust-lang.org -- a domain this sandbox's network * policy blocks (confirmed directly: 403 host_not_allowed). CBMC itself, * which Kani uses as its backend, has no such requirement and was already * present in the downloaded Kani release bundle. * * Translation notes (what could make this NOT equivalent to the Rust, and * why each one doesn't): * - Rust's `n.leading_zeros()` is a hardware CLZ intrinsic with no loop. * `__builtin_clzll(n)` is the same intrinsic in C, and CBMC models it as * a primitive bit operation, not a loop -- so, like the Rust version, * there is genuinely no loop anywhere in this function, and no --unwind * flag is needed for anything in isqrt_u64_fixed itself. * - Rust's `x.wrapping_add(n / x)` wraps silently on overflow for unsigned * integers. C's unsigned arithmetic wraps identically per the C standard * (6.2.5p9) -- no behavioral difference for uint64_t. * - Rust's `result.saturating_mul(result)` (used in the property, not in * isqrt_u64_fixed itself) is reproduced explicitly below as * saturating_mul_u64, since C has no native saturating multiply. */ #include <stdint.h> uint64_t isqrt_u64_fixed(uint64_t n) { if (n == 0) { return 0; } unsigned bits = 64u - (unsigned)__builtin_clzll(n); uint64_t x = 1ULL << ((bits + 1u) / 2u); /* Six unrolled Newton iterations -- no loop, matching the Rust exactly. */ { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } return x; } /* FIX-R: earlier drafts of this harness checked both properties with * saturating_mul_u64. That's fine for result^2 <= n (an overflowing true * product is astronomically larger than any representable n either way), * but wrong for (result+1)^2 > n: saturation collapses "exactly 2^64" and * "exactly UINT64_MAX" onto the same representable value, so at * n == UINT64_MAX the check compares UINT64_MAX > UINT64_MAX (false) even * though the true, unsaturated value (2^64) genuinely exceeds n. Confirmed * independently in Python: (4294967295+1)**2 == 2**64, which is > n for * n == 2**64-1. unsigned __int128 has enough headroom to represent * (2^64-1)^2 exactly, removing the ambiguity entirely. See * isqrt_boundary.c for the full trace this was diagnosed from. */ extern uint64_t nondet_uint64_t(void); /* CBMC verification harness -- mirrors verify_isqrt_correct's exact * assertion from fidelity.rs: for all n > 0, result^2 <= n; also checks * the floor-ness half ((result+1)^2 > n) as an extension beyond what the * original Kani harness specified. */ int main(void) { uint64_t n = nondet_uint64_t(); uint64_t result = isqrt_u64_fixed(n); if (n > 0) { __CPROVER_assert( (unsigned __int128)result * (unsigned __int128)result <= (unsigned __int128)n, "isqrt_u64_fixed: result^2 must not exceed n" ); __CPROVER_assert( ((unsigned __int128)result + 1) * ((unsigned __int128)result + 1) > (unsigned __int128)n, "isqrt_u64_fixed: (result+1)^2 must exceed n (result is the floor, not an underestimate)" ); } return 0; } 
+
+isqrt_param.c — parameterized to exact native widths (8/16/32/64) for tractable exhaustive checking:
+
+/* Same algorithm as isqrt.c, parameterized to a narrower bit-width via * -DWIDTH=N, so CBMC's bit-blasting SAT backend can complete exhaustively. * The Newton-step *logic* is identical to the u64 version; only the input * domain size changes, to find the largest width this sandbox's CBMC/SAT * solver combination can actually finish in practical time. */ #include <stdint.h> #ifndef WIDTH #define WIDTH 64 #endif /* FIX-R note: this originally used `WIDTH <= 8` / `<= 16` / `<= 32` bucket * comparisons, intending e.g. WIDTH=20 to test a genuinely 20-bit domain. * It didn't: `uN` was still a full uint32_t for any 17..32 value, so `n` * actually ranged over all 2^32 values regardless of what WIDTH claimed, * and the CLZ adjustment (correct only when WIDTH exactly matches the * type's real bit-width) underflowed as an unsigned computation whenever a * value needed more than WIDTH bits to represent -- which was common, * since the domain was never actually restricted. CBMC caught this * directly (see the write-up): "shift distance too large", immediately, * for WIDTH=20/24/28. This is only allowing the widths where `uN` is * genuinely that many bits, so WIDTH always means what it says. */ #if WIDTH == 8 typedef uint8_t uN; #define UN_MAX UINT8_MAX #define CLZ(x) (__builtin_clz((unsigned)(x)) - 24) #elif WIDTH == 16 typedef uint16_t uN; #define UN_MAX UINT16_MAX #define CLZ(x) (__builtin_clz((unsigned)(x)) - 16) #elif WIDTH == 32 typedef uint32_t uN; #define UN_MAX UINT32_MAX #define CLZ(x) __builtin_clz((unsigned)(x)) #elif WIDTH == 64 typedef uint64_t uN; #define UN_MAX UINT64_MAX #define CLZ(x) __builtin_clzll(x) #else #error "WIDTH must be exactly 8, 16, 32, or 64 -- see FIX-R note above" #endif uN isqrt_fixed(uN n) { if (n == 0) { return 0; } unsigned bits = (unsigned)WIDTH - (unsigned)CLZ(n); uN x = (uN)(1ULL << ((bits + 1u) / 2u)); { uN y = (uN)((x + n / x) / 2); if (!(y >= x)) x = y; } { uN y = (uN)((x + n / x) / 2); if (!(y >= x)) x = y; } { uN y = (uN)((x + n / x) / 2); if (!(y >= x)) x = y; } { uN y = (uN)((x + n / x) / 2); if (!(y >= x)) x = y; } { uN y = (uN)((x + n / x) / 2); if (!(y >= x)) x = y; } { uN y = (uN)((x + n / x) / 2); if (!(y >= x)) x = y; } return x; } uint64_t saturating_mul_uN(uint64_t a, uint64_t b) { if (a == 0 || b == 0) { return 0; } if (a > (uint64_t)UN_MAX / b) { return (uint64_t)UN_MAX * (uint64_t)UN_MAX; /* clearly exceeds any n in range */ } return a * b; } int main(void) { uN n; /* uninitialized -> CBMC treats as nondeterministic */ uN result = isqrt_fixed(n); if (n > 0) { __CPROVER_assert( saturating_mul_uN((uint64_t)result, (uint64_t)result) <= (uint64_t)n, "isqrt_fixed: result^2 must not exceed n" ); } if (n > 0 && result < UN_MAX) { __CPROVER_assert( saturating_mul_uN((uint64_t)(result + 1), (uint64_t)(result + 1)) > (uint64_t)n, "isqrt_fixed: (result+1)^2 must exceed n" ); } return 0; } 
+
+isqrt_boundary.c — full 64-bit type, input constrained to the boundary region near u64::MAX:
+
+/* Full 64-bit isqrt_u64_fixed, but with n constrained via __CPROVER_assume * to the region near UINT64_MAX -- the specific boundary the original * review flagged as the sharpest edge case (seed computation at the * maximum bit-length, and the value the FIX-N write-up's own edge-case * sweep specifically targeted). This is tractable where the fully * unconstrained 64-bit domain was not, because it doesn't reduce the * arithmetic's bit-width -- it restricts which inputs are explored, not * how wide the multiply/divide circuits are. */ #include <stdint.h> uint64_t isqrt_u64_fixed(uint64_t n) { if (n == 0) { return 0; } unsigned bits = 64u - (unsigned)__builtin_clzll(n); uint64_t x = 1ULL << ((bits + 1u) / 2u); { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; } return x; } /* FIX-R: the first cut of this harness used saturating_mul_u64 for BOTH * checks. For the first property (r^2 <= n) that's fine: if the true r^2 * overflows u64, it's astronomically larger than any representable n, so * saturating to UINT64_MAX and comparing still correctly flags a genuine * violation. But for the second property ((r+1)^2 > n), saturating * silently collapses two DIFFERENT true values -- "exactly 2^64" (one past * u64's range) and "exactly UINT64_MAX" -- onto the same representable * number, so at n = UINT64_MAX the check compares UINT64_MAX > UINT64_MAX, * which is false, even though the true unsaturated value (2^64) genuinely * exceeds n. CBMC caught this immediately as a "failure" that turned out * to be a checker artifact, not an algorithm bug (confirmed independently * in Python: (4294967295+1)**2 == 2**64 == 18446744073709551616, which is * indeed > n == 2**64-1). unsigned __int128 has enough headroom to represent * (2^64-1)^2 exactly with zero ambiguity, so it's used here for both * checks instead of saturating arithmetic. */ int main(void) { uint64_t n; __CPROVER_assume(n >= UINT64_MAX - 100000); /* the top 100,001 values */ uint64_t result = isqrt_u64_fixed(n); __CPROVER_assert( (unsigned __int128)result * (unsigned __int128)result <= (unsigned __int128)n, "isqrt_u64_fixed: result^2 must not exceed n (near UINT64_MAX)" ); /* Cast to unsigned __int128 BEFORE adding 1: `result + 1` computed in u64 * first would still wrap to 0 at result == UINT64_MAX, reintroducing * exactly the kind of overflow-masking bug this fix exists to remove. */ __CPROVER_assert( ((unsigned __int128)result + 1) * ((unsigned __int128)result + 1) > (unsigned __int128)n, "isqrt_u64_fixed: (result+1)^2 must exceed n (near UINT64_MAX)" ); return 0; } 
+
+Two real bugs found in the verification harness (not in the algorithm)
+
+Running this for real, like the PyO3 and TLA+ work before it, surfaced genuine mistakes — both in my own C translation, not in isqrt_u64_fixed.
+
+Bug 1: a width-parameterization bug CBMC caught immediately
+
+The first cut of isqrt_param.c used range comparisons (WIDTH <= 8, <= 16, <= 32) intending e.g. WIDTH=20 to test a genuinely 20-bit domain. It didn't: uN was still a full uint32_t for any width in 17..32, so n actually ranged over all 2^32 values regardless of what WIDTH claimed, and the leading-zero-count adjustment (correct only when WIDTH exactly matches the type's real bit-width) underflowed as unsigned arithmetic whenever a value needed more bits than the claimed WIDTH. CBMC caught this immediately and concretely:
+
+[isqrt_fixed.undefined-shift.1] line 38 shift distance too large in 1ull << (bits + 1u) / 2u: FAILURE [isqrt_fixed.division-by-zero.1] line 40 division by zero in n / x: FAILURE 
+
+Fixed by only supporting exact native widths (8/16/32/64), where the type genuinely is that many bits — see the #if WIDTH == 8 / == 16 / == 32 / == 64 structure in isqrt_param.c above, with a #error for anything else so this can't silently regress again.
+
+Bug 2: saturating multiplication hid the true value at exactly one input
+
+A targeted check of the region near u64::MAX (isqrt_boundary.c) reported a genuine-looking failure:
+
+[main.assertion.2] line 47 isqrt_u64_fixed: (result+1)^2 must exceed n (near UINT64_MAX): FAILURE 
+
+The counterexample: n = 18446744073709551615 (u64::MAX exactly). Manual analysis confirmed the algorithm is correct here — result = 4294967295 is genuinely the floor square root — but the check was wrong:
+
+n = 2**64 - 1 r = 4294967295 print((r+1)**2 > n) # True -- 2**64 > 2**64 - 1, correctly print((r+1)**2 == 2**64) # True -- but 2**64 overflows u64 by exactly 1 
+
+saturating_mul_u64((r+1), (r+1)) saturates the true value (2**64, one past u64's range) down to UINT64_MAX — which is numerically identical to n itself at this exact input, so the checker's > comparison incorrectly reports equality instead of "true value exceeds n." This is a checker-precision artifact, not an algorithm bug: result^2 <= n (the actual original Kani-harness property) passed throughout; only the floor-ness check I added as an extension beyond Kani's original scope had this gap, and only at this one input. Fixed by using unsigned __int128 (GCC/CBMC builtin, confirmed to work directly: see mini128.c test below) for both checks, which has enough headroom to represent (2^64-1)^2 exactly with zero ambiguity — re-run below, now passing.
+
+I also made the exact same C-vs-TLA+ comment-syntax typo (*) instead of */) twice while writing the fix for bug 2, each time silently swallowing the rest of the file into one giant unterminated comment and producing a confusing "syntax error before '}'" several dozen lines away from the real problem. Both instances were caught by actually trying to compile the file — exactly the value of running things for real instead of trusting that text written by analogy to a different language's comment syntax is correct.
+
+Validation — real CBMC runs
+
+Exhaustive verification at native bit-widths
+
+cbmc isqrt_param.c -DWIDTH=8 --function main # 256 values cbmc isqrt_param.c -DWIDTH=16 --function main # 65,536 values === WIDTH=8 === exit=0 elapsed=0s ** 0 of 25 failed (1 iterations) VERIFICATION SUCCESSFUL === WIDTH=16 === exit=0 elapsed=9s ** 0 of 25 failed (1 iterations) VERIFICATION SUCCESSFUL 
+
+Every CBMC-generated safety check (shift-overflow, division-by-zero, undefined leading-zero-of-zero) passed too, alongside both correctness assertions (result^2 <= n and (result+1)^2 > n) — genuine, exhaustive proof over the complete 8-bit and 16-bit input domains, not sampling.
+
+Where exhaustive bit-blasting stops being tractable
+
+cbmc isqrt_param.c -DWIDTH=32 --function main # 4,294,967,296 values exit=124 elapsed=200s (timed out, no result) 
+
+An earlier attempt at the full, unconstrained 64-bit domain (isqrt.c with nondet_uint64_t() completely free) was also attempted and did not complete — it produced no further output after "Running propositional reduction" and was gone from the process list shortly after, consistent with being killed for memory exhaustion bit-blasting a 64-bit multiply/divide circuit with symbolic operands. This is a well-known, general SAT-solver scaling limit for bit-vector multiplication/division — not specific to this sandbox, and not avoided by using real Kani either, since Kani uses this exact same CBMC backend underneath. A genuine Kani run against the unconstrained 64-bit harness, had it been runnable here at all, would very plausibly hit the identical wall.
+
+The targeted fix: constrain the input, not the bit-width
+
+cbmc isqrt_boundary.c --function main exit=0 elapsed=1s SAT checker: instance is UNSATISFIABLE [main.assertion.1] line 51 isqrt_u64_fixed: result^2 must not exceed n (near UINT64_MAX): SUCCESS [main.assertion.2] line 58 isqrt_u64_fixed: (result+1)^2 must exceed n (near UINT64_MAX): SUCCESS ** 0 of 10 failed (1 iterations) VERIFICATION SUCCESSFUL 
+
+This keeps the full 64-bit arithmetic (not a reduced bit-width) but constrains which inputs are explored (__CPROVER_assume(n >= UINT64_MAX - 100000)) to the specific region the original review's own edge-case sweep flagged as sharpest — genuine, exact verification of the hardest 100,001 inputs in the entire 64-bit domain, completing in 1 second where the unconstrained version couldn't complete at all.
+
+What this does and doesn't establish
+
+Established, for real:
+
+isqrt_u64_fixed's algorithm is exhaustively correct over the full 8-bit and 16-bit input domains (real model checking, not sampling).
+
+It is exactly correct — both halves of "floor square root" — for every one of the 100,001 hardest inputs near u64::MAX, with exact (not saturating) arithmetic.
+
+Two real mistakes were found and fixed in the verification tooling itself, neither of which was a bug in the Rust algorithm under test.
+
+Not established:
+
+Exhaustive proof over the full, unconstrained 64-bit domain (2^64 values). That remains outside what this sandbox's SAT-based bit-blasting can complete in practical time — a real, confirmed boundary, not a presumed one, and one that would very plausibly affect an actual Kani run too. FIX-N's earlier plain-Rust validation (exhaustive 1..1,000,000, plus a 200,000-sample pseudo-random sweep) remains the broadest empirical coverage of the full 64-bit domain available from this sandbox; this patch adds genuine proof at smaller/targeted scopes on top of that, not a replacement for it.
+
+Suggested next step, if this is worth pursuing further
+
+The natural way to close the remaining gap without needing Kani's blocked Rust frontend at all would be k-induction rather than brute-force bit-blasting: CBMC supports --incremental-bmc and dedicated induction tactics that can prove a property holds for all n by induction over the 6 fixed Newton steps' convergence behavior, rather than exhaustively enumerating every possible 64-bit value. That's a meaningfully different (and harder to set up correctly) proof strategy than anything attempted here, so it's flagged as a next step rather than attempted in this pass.
+

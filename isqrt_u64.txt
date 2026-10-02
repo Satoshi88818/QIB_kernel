@@ -1,0 +1,53 @@
+/* Full 64-bit isqrt_u64_fixed, but with n constrained via __CPROVER_assume
+ * to the region near UINT64_MAX -- the specific boundary the original
+ * review flagged as the sharpest edge case (seed computation at the
+ * maximum bit-length, and the value the FIX-N write-up's own edge-case
+ * sweep specifically targeted). This is tractable where the fully
+ * unconstrained 64-bit domain was not, because it doesn't reduce the
+ * arithmetic's bit-width -- it restricts which inputs are explored, not
+ * how wide the multiply/divide circuits are.
+ */
+
+#include <stdint.h>
+
+uint64_t isqrt_u64_fixed(uint64_t n) {
+    if (n == 0) {
+        return 0;
+    }
+    unsigned bits = 64u - (unsigned)__builtin_clzll(n);
+    uint64_t x = 1ULL << ((bits + 1u) / 2u);
+
+    { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; }
+    { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; }
+    { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; }
+    { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; }
+    { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; }
+    { uint64_t y = (x + n / x) / 2; if (!(y >= x)) x = y; }
+
+    return x;
+}
+
+uint64_t saturating_mul_u64(uint64_t a, uint64_t b) {
+    if (a == 0 || b == 0) return 0;
+    if (a > UINT64_MAX / b) return UINT64_MAX;
+    return a * b;
+}
+
+int main(void) {
+    uint64_t n;
+    __CPROVER_assume(n >= UINT64_MAX - 100000);  /* the top 100,001 values */
+
+    uint64_t result = isqrt_u64_fixed(n);
+
+    __CPROVER_assert(
+        saturating_mul_u64(result, result) <= n,
+        "isqrt_u64_fixed: result^2 must not exceed n (near UINT64_MAX)"
+    );
+    if (result < UINT64_MAX) {
+        __CPROVER_assert(
+            saturating_mul_u64(result + 1, result + 1) > n,
+            "isqrt_u64_fixed: (result+1)^2 must exceed n (near UINT64_MAX)"
+        );
+    }
+    return 0;
+}
